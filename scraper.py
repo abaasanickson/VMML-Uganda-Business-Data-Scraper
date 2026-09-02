@@ -21,8 +21,10 @@ REQUEST_TIMEOUT = 4
 BROWSER_TIMEOUT = 7000
 MAX_RECORDS_PER_SOURCE = 10000
 MAX_TOTAL_RESULTS = 50000
-MAX_PAGES_PER_SOURCE = 250
-MAX_DETAIL_PAGES_PER_SOURCE = 300
+MAX_PAGES_PER_SOURCE = 500
+MAX_DETAIL_PAGES_PER_SOURCE = 500
+MAX_OSM_ELEMENTS_PER_QUERY = 5000
+ENABLE_BROWSER_FALLBACK = os.getenv("ENABLE_BROWSER_FALLBACK", "0") == "1"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36"
 
 SOURCE_NAMES = [
@@ -264,8 +266,12 @@ def http_html(url):
             return r.text, r.url
     except requests.RequestException:
         pass
-    # Only invoke the browser after the cheap direct request fails.
-    return browser_html(url)
+    # Browser rendering is deliberately opt-in on Community Cloud because Chromium
+    # can consume hundreds of MB of RAM and cause the whole Streamlit process to be
+    # killed during a broad Western Uganda search.
+    if ENABLE_BROWSER_FALLBACK:
+        return browser_html(url)
+    return None, url
 
 
 def soup_from(html):
@@ -452,7 +458,7 @@ def yellow_category_candidates(region, keyword, page_cache, deadline):
 
     # Category indexes are independent. Parallel discovery prevents Western Uganda's
     # many towns from consuming the whole Yellow Uganda source time slice.
-    workers=min(8,max(1,len(cities)))
+    workers=min(4,max(1,len(cities)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures=[ex.submit(inspect_city,c) for c in cities]
         for fut in as_completed(futures):
@@ -683,48 +689,88 @@ def scrape_kcca(region,keyword,deadline):
     ],region,keyword,"KCCA Business Register",["/businesses"],deadline,detail_markers=False)
 
 
-def osm_query(bbox,keyword):
-    q=norm(keyword)
-    tokens=[t for t in q.split() if len(t)>=3]
-    terms=list(dict.fromkeys([q]+tokens[:4]))
-    keys=["name","brand","operator","description","shop","amenity","office","craft","industrial","healthcare","tourism","building"]
-    blocks=[]
+def osm_query(bbox, keyword):
+    """Build a compact Overpass query.
+
+    The previous version generated hundreds/thousands of regex clauses for each
+    Western Uganda bounding box. That was both slow and memory-heavy. We instead
+    search the most useful free-text fields plus common category fields in a small
+    number of queries.
+    """
+    q = norm(keyword)
+    tokens = [t for t in q.split() if len(t) >= 3][:4]
+    terms = list(dict.fromkeys([q] + tokens))
+    blocks = []
     for term in terms:
-        if not term: continue
-        safe=term.replace('"','')
-        for key in keys:
-            for typ in ("node","way","relation"):
-                blocks.append(f'{typ}["{key}"~"{safe}",i]({bbox});')
-    return "[out:json][timeout:25];(\n"+"\n".join(blocks)+"\n);out center tags;"
+        safe = re.sub(r"[^a-zA-Z0-9 _-]", "", term).strip()
+        if not safe:
+            continue
+        pattern = re.escape(safe).replace(r"\ ", r"[ _-]+")
+        for key in ["name", "brand", "operator", "description", "shop", "amenity", "office", "craft", "industrial", "healthcare", "tourism"]:
+            blocks.append(f'nwr["{key}"~"{pattern}",i]({bbox});')
+    return "[out:json][timeout:20];(\n" + "\n".join(blocks) + "\n);out center tags;"
 
 
-def fetch_osm_grid_data(region_name,keyword):
-    out=[]; seen=set(); deadline=time.monotonic()+SEARCH_BUDGET_SECONDS
-    for bbox in REGION_BBOXES.get(region_name,[]):
-        if time.monotonic()>=deadline or len(out)>=MAX_RECORDS_PER_SOURCE: break
-        query=osm_query(bbox,keyword)
+def fetch_osm_grid_data(region_name, keyword):
+    out = []
+    seen = set()
+    deadline = time.monotonic() + SEARCH_BUDGET_SECONDS
+
+    for bbox in REGION_BBOXES.get(region_name, []):
+        if time.monotonic() >= deadline or len(out) >= MAX_RECORDS_PER_SOURCE:
+            break
+        query = osm_query(bbox, keyword)
         for endpoint in OVERPASS:
+            if time.monotonic() >= deadline:
+                break
             try:
-                r=requests.post(endpoint,data=query,headers={"User-Agent":USER_AGENT},timeout=32)
-                if r.status_code!=200: continue
-                for el in r.json().get("elements",[]):
-                    tags=el.get("tags",{}); name=clean_text(tags.get("name"))
-                    if name=="N/A": continue
-                    c=el.get("center",{}); lat=el.get("lat",c.get("lat","N/A")); lng=el.get("lon",c.get("lon","N/A"))
-                    addr=", ".join(str(tags[k]) for k in ["addr:housenumber","addr:street","addr:place","addr:suburb","addr:city","addr:district","addr:postcode"] if tags.get(k))
-                    category=next((clean_text(tags.get(k)) for k in ["shop","amenity","office","craft","industrial","healthcare","tourism"] if tags.get(k)),"N/A")
-                    deals=clean_text(tags.get("description") or tags.get("operator") or tags.get("brand") or category)
-                    district=clean_text(tags.get("addr:district") or tags.get("is_in:district") or "N/A")
-                    rec=make_record(name,region_name,keyword,"OpenStreetMap",endpoint,tags.get("phone") or tags.get("contact:phone","N/A"),tags.get("website") or tags.get("contact:website","N/A"),addr or "N/A",category,deals,tags.get("email") or tags.get("contact:email","N/A"),tags.get("rating","N/A"),lat,lng,district)
-                    key=(norm(name),norm(addr) or norm(f"{lat}|{lng}"))
+                remaining = max(5, min(25, int(deadline - time.monotonic())))
+                r = requests.post(endpoint, data=query, headers={"User-Agent": USER_AGENT}, timeout=remaining)
+                if r.status_code != 200:
+                    continue
+                elements = r.json().get("elements", [])[:MAX_OSM_ELEMENTS_PER_QUERY]
+                for el in elements:
+                    tags = el.get("tags", {})
+                    name = clean_text(tags.get("name"))
+                    if name == "N/A":
+                        continue
+                    c = el.get("center", {})
+                    lat = el.get("lat", c.get("lat", "N/A"))
+                    lng = el.get("lon", c.get("lon", "N/A"))
+                    addr = ", ".join(str(tags[k]) for k in [
+                        "addr:housenumber", "addr:street", "addr:place", "addr:suburb",
+                        "addr:city", "addr:district", "addr:postcode"
+                    ] if tags.get(k))
+                    category = next((clean_text(tags.get(k)) for k in [
+                        "shop", "amenity", "office", "craft", "industrial", "healthcare", "tourism"
+                    ] if tags.get(k)), "N/A")
+                    deals = clean_text(tags.get("description") or tags.get("operator") or tags.get("brand") or category)
+                    district = clean_text(tags.get("addr:district") or tags.get("is_in:district") or "N/A")
+                    rec = make_record(
+                        name, region_name, keyword, "OpenStreetMap", endpoint,
+                        tags.get("phone") or tags.get("contact:phone", "N/A"),
+                        tags.get("website") or tags.get("contact:website", "N/A"),
+                        addr or "N/A", category, deals,
+                        tags.get("email") or tags.get("contact:email", "N/A"),
+                        tags.get("rating", "N/A"), lat, lng, district
+                    )
+                    if not keyword_match(rec, keyword):
+                        continue
+                    key = (norm(name), norm(addr) or norm(f"{lat}|{lng}"))
                     if key not in seen:
-                        seen.add(key); out.append(rec)
-                    if len(out)>=MAX_RECORDS_PER_SOURCE: break
-                if out: break
+                        seen.add(key)
+                        out.append(rec)
+                    if len(out) >= MAX_RECORDS_PER_SOURCE:
+                        break
+                # A successful endpoint is enough for this bbox; move to the next
+                # geographic area instead of duplicating every object from both mirrors.
+                break
             except Exception:
                 continue
-    fetch_osm_grid_data.last_count=len(out)
+
+    fetch_osm_grid_data.last_count = len(out)
     return out[:MAX_RECORDS_PER_SOURCE]
+
 
 fetch_osm_grid_data.last_count=0
 
@@ -776,7 +822,7 @@ def scrape_ugandan_directories(region_name,keyword):
     all_records=[]; counts={s:0 for s in SOURCE_NAMES}; errors={}
     # Sources are independent. Run them concurrently so one slow site does not consume
     # the entire search window. Each worker still has its own hard source deadline.
-    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+    with ThreadPoolExecutor(max_workers=min(3, len(jobs))) as ex:
         futures=[ex.submit(_run_source,n,f,region_name,keyword) for n,f in jobs]
         for fut in as_completed(futures):
             name,recs,err=fut.result(); counts[name]=len(recs); all_records.extend(recs)
